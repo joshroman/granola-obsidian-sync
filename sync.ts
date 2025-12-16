@@ -102,6 +102,7 @@ interface MeetingData {
   meetingUrl?: string;
   durationMin?: number;
   panelContent?: string;
+  tags?: string[];
 }
 
 // VAULT INDEX
@@ -122,12 +123,41 @@ function normalizeTitle(title: string): string {
 }
 
 // CHECK IF TRANSCRIPT SHOULD BE SYNCED FOR THIS MEETING
+function titleHasTranscriptTag(title: string): boolean {
+  return /(\s|^)#transcript(\b|[^\w])/i.test(title);
+}
+
+function stripTranscriptTag(title: string): string {
+  // Remove '#transcript' token, collapse spaces, and tidy spaces before punctuation
+  let s = title.replace(/(^|\s)#transcript(\b)/ig, '$1');
+  s = s.replace(/\s{2,}/g, ' ');
+  s = s.replace(/\s+([,.;:!?])/g, '$1');
+  return s.trim();
+}
+
+// Titles that always get transcripts (case-insensitive prefix match)
+const ALWAYS_TRANSCRIPT_TITLES = [
+  'meet this moment',
+  'mindshift recovery national call',
+];
+
+function titleAlwaysGetsTranscript(title: string): boolean {
+  const titleLower = title.toLowerCase();
+  return ALWAYS_TRANSCRIPT_TITLES.some(pattern => titleLower.startsWith(pattern));
+}
+
 function shouldSyncTranscript(title: string): boolean {
+  // Directive tag always forces inclusion
+  if (titleHasTranscriptTag(title)) return true;
+
+  // Specific meeting types always get transcripts
+  if (titleAlwaysGetsTranscript(title)) return true;
+
   // If no filters are configured, use global setting
   if (config.transcriptTitleFilter.length === 0) {
     return config.syncTranscript;
   }
-  
+
   // Check if any filter matches the title (case-insensitive)
   const titleLower = title.toLowerCase();
   return config.transcriptTitleFilter.some(filter => titleLower.includes(filter));
@@ -337,7 +367,7 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
   }
 
   // Create frontmatter
-  const frontmatter = {
+  const frontmatter: Record<string, any> = {
     title: data.title,
     date: data.startTime.toISOString().split('T')[0],
     attendees: data.attendees,
@@ -355,6 +385,11 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
     transcript_url: data.status === 'filed' ? `https://notes.granola.ai/d/${data.id}` : ''
   };
 
+  // Preserve directive in frontmatter tags
+  if (data.tags && data.tags.length > 0) {
+    frontmatter.tags = data.tags;
+  }
+
   // Create content based on status
   const content = data.status === 'filed'
     ? `# ${data.title}
@@ -365,7 +400,7 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
 
 ## Summary
 
-${data.panelContent || ''}${shouldSyncTranscript(data.title) && data.transcript ? `
+${data.panelContent || ''}${data.transcript ? `
 
 ## Transcript
 ${data.transcript}` : ''}`
@@ -515,6 +550,8 @@ async function main(): Promise<void> {
     
     // Filter out solo/empty meetings
     const processedTranscript = processTranscript(transcriptData);
+    const hasTranscriptDirective = titleHasTranscriptTag(meeting.title);
+    const cleanedTitle = hasTranscriptDirective ? stripTranscriptTag(meeting.title) : meeting.title;
     const skipCheck = shouldSkipPastMeeting({
       attendees: metadata.attendees || [],
       transcript: processedTranscript,
@@ -558,14 +595,15 @@ async function main(): Promise<void> {
     // Normalize data for shared function
     const meetingData: MeetingData = {
       id: meeting.id,
-      title: meeting.title,
+      title: cleanedTitle,
       startTime: new Date(meeting.created_at),
       attendees: metadata.attendees?.map(normalizeAttendee).filter(Boolean) || [],
       organizer: metadata.creator?.name || '',
       location: '',
       status: 'filed',
       transcript: finalTranscript,
-      panelContent: panelContent
+      panelContent: panelContent,
+      tags: hasTranscriptDirective ? ['#transcript'] : undefined
     };
     
     // DEDUPLICATION: Check for matching scheduled meeting

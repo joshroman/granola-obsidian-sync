@@ -152,6 +152,15 @@ temp/                 # temporary files (git ignored)
 - **Updates**: Scheduled meetings that become filed meetings
 - **Timezone**: All operations use Eastern US timezone for consistency
 
+## Transcript Overrides
+
+Transcripts are always included for:
+- **#transcript tag**: Meeting title contains `#transcript` (case-insensitive). Tag is stripped from saved title/filename and added to frontmatter tags.
+- **Meet This Moment**: Meetings with titles starting with "Meet This Moment"
+- **Mindshift Recovery National Call**: Meetings with titles starting with "Mindshift Recovery National Call"
+
+For all other meetings, transcripts follow `SYNC_TRANSCRIPT` and `TRANSCRIPT_TITLE_FILTER` settings.
+
 ## Failure Behavior
 
 - **API Validation**: "0 meetings returned" triggers failure notification

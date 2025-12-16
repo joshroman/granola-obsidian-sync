@@ -234,6 +234,11 @@ export function shouldSkipPastMeeting(meeting: {
   durationInMinutes?: number;
   title?: string;
 }): { skip: boolean; reason?: string } {
+  // If directive tag is present, never skip based on solo/empty checks
+  if (meeting.title && /(\s|^)#transcript(\b|[^\w])/i.test(meeting.title)) {
+    return { skip: false };
+  }
+
   const attendees = meeting.attendees || [];
   
   // No attendees = solo meeting
