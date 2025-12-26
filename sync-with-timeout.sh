@@ -112,6 +112,9 @@ main() {
 
     if [[ $exit_code -eq 0 ]]; then
         log "Sync completed successfully"
+        # Count synced meetings from log (look for "Created:" lines)
+        local synced_count=$(grep -c "Created:" "$LOG_FILE" 2>/dev/null | tail -1 || echo "0")
+        send_success_notification "Granola Sync" "${synced_count} meetings synced" "Obsidian"
     else
         log "Sync failed with exit code $exit_code"
         local last_error=$(tail -5 "$LOG_FILE" 2>/dev/null | grep -v "^\[" | head -1 || echo "Exit code $exit_code")
