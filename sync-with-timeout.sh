@@ -6,9 +6,16 @@
 # 1. Running the sync with a timeout (default 10 minutes)
 # 2. Killing any stuck processes
 # 3. Logging the outcome
+# 4. Sending error notifications via Pushover/Slack on failure
 #
 
 set -uo pipefail
+
+# Source shared notification library
+NOTIFY_LIB="$HOME/.config/josh-automations/notify.sh"
+if [[ -f "$NOTIFY_LIB" ]]; then
+    source "$NOTIFY_LIB"
+fi
 
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,6 +101,7 @@ main() {
             kill -9 "$sync_pid" 2>/dev/null || true
             # Kill any child processes
             pkill -9 -P "$sync_pid" 2>/dev/null || true
+            send_error_notification "Granola → Obsidian Sync" "Sync timed out after ${TIMEOUT_SECONDS}s"
             exit 1
         fi
     done
@@ -106,6 +114,8 @@ main() {
         log "Sync completed successfully"
     else
         log "Sync failed with exit code $exit_code"
+        local last_error=$(tail -5 "$LOG_FILE" 2>/dev/null | grep -v "^\[" | head -1 || echo "Exit code $exit_code")
+        send_error_notification "Granola → Obsidian Sync" "Sync failed: $last_error"
     fi
 
     return $exit_code
