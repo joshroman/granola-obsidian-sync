@@ -83,7 +83,9 @@ main() {
     log "Starting sync (timeout: ${TIMEOUT_SECONDS}s)..."
 
     # Run sync with timeout using background process + wait
-    "$BUN_PATH" "$SYNC_SCRIPT" &
+    # Capture output to temp file for counting new syncs
+    local sync_output_file=$(mktemp)
+    "$BUN_PATH" "$SYNC_SCRIPT" > "$sync_output_file" 2>&1 &
     local sync_pid=$!
 
     # Update lock file with actual sync PID
@@ -101,6 +103,7 @@ main() {
             kill -9 "$sync_pid" 2>/dev/null || true
             # Kill any child processes
             pkill -9 -P "$sync_pid" 2>/dev/null || true
+            rm -f "$sync_output_file"
             send_error_notification "Granola → Obsidian Sync" "Sync timed out after ${TIMEOUT_SECONDS}s"
             exit 1
         fi
@@ -110,17 +113,24 @@ main() {
     wait "$sync_pid"
     local exit_code=$?
 
+    # Append sync output to log file and display
+    cat "$sync_output_file" | tee -a "$LOG_FILE"
+
     if [[ $exit_code -eq 0 ]]; then
         log "Sync completed successfully"
-        # Count successfully synced meetings (marked with ✓)
-        local synced_count=$(grep -c "^✓ " "$LOG_FILE" 2>/dev/null || echo "0")
+        # Count successfully synced meetings from THIS run only (marked with ✓)
+        local synced_count
+        synced_count=$(grep -c "^✓ " "$sync_output_file" 2>/dev/null) || synced_count=0
+        rm -f "$sync_output_file"
         # Only notify if 1+ meetings were synced
         if [[ "$synced_count" -gt 0 ]]; then
             send_success_notification "Granola Sync" "${synced_count} meetings synced to Obsidian"
         fi
     else
         log "Sync failed with exit code $exit_code"
-        local last_error=$(tail -5 "$LOG_FILE" 2>/dev/null | grep -v "^\[" | head -1 || echo "Exit code $exit_code")
+        local last_error
+        last_error=$(tail -5 "$sync_output_file" 2>/dev/null | grep -v "^\[" | head -1) || last_error="Exit code $exit_code"
+        rm -f "$sync_output_file"
         send_error_notification "Granola → Obsidian Sync" "Sync failed: $last_error"
     fi
 
