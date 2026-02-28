@@ -61,6 +61,61 @@ const API_BASE = 'https://api.granola.ai/v1';
 const VAULT_PATH = config.obsidianVaultPath;
 const TOKEN_PATH = config.granolaAuthPath;
 
+// TOKEN REFRESH - Decode JWT expiry and refresh via Granola API if needed
+function decodeJwtPayload(token: string): Record<string, any> {
+  const parts = token.split('.');
+  if (parts.length !== 3) return {};
+  const payload = Buffer.from(parts[1], 'base64url').toString('utf-8');
+  return JSON.parse(payload);
+}
+
+function isTokenExpired(token: string, bufferSeconds = 300): boolean {
+  const payload = decodeJwtPayload(token);
+  if (!payload.exp) return true;
+  return Date.now() / 1000 > payload.exp - bufferSeconds;
+}
+
+async function getValidToken(): Promise<string> {
+  const raw = await readFile(TOKEN_PATH, 'utf-8');
+  const tokenData = JSON.parse(raw);
+  const tokens = JSON.parse(tokenData.workos_tokens);
+  const accessToken = tokens.access_token;
+
+  if (!accessToken) throw new Error('No auth token found in supabase.json');
+
+  if (!isTokenExpired(accessToken)) return accessToken;
+
+  // Token expired or expiring soon — refresh it
+  const refreshToken = tokens.refresh_token;
+  if (!refreshToken) throw new Error('No refresh token available — open Granola app to re-authenticate');
+
+  console.log('🔑 Access token expired, refreshing...');
+
+  const response = await fetch(`${API_BASE}/refresh-access-token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token: refreshToken })
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`Token refresh failed (${response.status}): ${body} — open Granola app to re-authenticate`);
+  }
+
+  const newTokens = await response.json();
+
+  if (!newTokens.access_token) {
+    throw new Error('Token refresh returned no access_token — open Granola app to re-authenticate');
+  }
+
+  // Write refreshed tokens back to supabase.json so Granola app stays in sync
+  tokenData.workos_tokens = JSON.stringify(newTokens);
+  await writeFile(TOKEN_PATH, JSON.stringify(tokenData), 'utf-8');
+
+  console.log('✅ Token refreshed successfully');
+  return newTokens.access_token;
+}
+
 // Template identification for panel processing
 const TEMPLATE_SLUG = 'b491d27c-1106-4ebf-97c5-d5129742945c';
 
@@ -173,63 +228,40 @@ function isWithinTimeWindow(time1: Date, time2: Date): boolean {
 // VAULT INDEXING - SCAN EXISTING MEETING FILES
 async function indexVaultMeetings(vaultPath: string): Promise<ExistingMeeting[]> {
   const meetings: ExistingMeeting[] = [];
-  
+
   try {
-    const years = await readdir(vaultPath);
-    
-    for (const year of years) {
-      if (!year.match(/^\d{4}$/)) continue; // Skip non-year folders
-      
-      const yearPath = join(vaultPath, year);
-      const yearStat = await stat(yearPath);
-      if (!yearStat.isDirectory()) continue;
-      
-      const months = await readdir(yearPath);
-      
-      for (const month of months) {
-        const monthPath = join(yearPath, month);
-        const monthStat = await stat(monthPath);
-        if (!monthStat.isDirectory()) continue;
-        
-        const days = await readdir(monthPath);
-        
-        for (const day of days) {
-          const dayPath = join(monthPath, day);
-          const dayStat = await stat(dayPath);
-          if (!dayStat.isDirectory()) continue;
-          
-          const files = await readdir(dayPath);
-          
-          for (const file of files) {
-            if (!file.endsWith('.md')) continue;
-            
-            const filePath = join(dayPath, file);
-            try {
-              const content = await readFile(filePath, 'utf-8');
-              const parsed = matter(content);
-              const frontmatter = parsed.data;
-              
-              if (frontmatter.source === 'granola' && frontmatter.calendar_event_id) {
-                meetings.push({
-                  filePath,
-                  title: frontmatter.title || '',
-                  startTime: new Date(frontmatter.start_time || ''),
-                  status: frontmatter.status || 'scheduled',
-                  id: frontmatter.calendar_event_id
-                });
-              }
-            } catch (error) {
-              // Skip files that can't be parsed
-              continue;
-            }
-          }
+    const files = await readdir(vaultPath);
+
+    for (const file of files) {
+      if (!file.endsWith('.md')) continue;
+
+      const filePath = join(vaultPath, file);
+      try {
+        const fileStat = await stat(filePath);
+        if (!fileStat.isFile()) continue;
+
+        const content = await readFile(filePath, 'utf-8');
+        const parsed = matter(content);
+        const frontmatter = parsed.data;
+
+        if (frontmatter.source === 'granola' && frontmatter.calendar_event_id) {
+          meetings.push({
+            filePath,
+            title: frontmatter.title || '',
+            startTime: new Date(frontmatter.start_time || ''),
+            status: frontmatter.status || 'scheduled',
+            id: frontmatter.calendar_event_id
+          });
         }
+      } catch (error) {
+        // Skip files that can't be parsed
+        continue;
       }
     }
   } catch (error) {
     console.error('Error indexing vault:', error);
   }
-  
+
   return meetings;
 }
 
@@ -328,34 +360,24 @@ function normalizeAttendee(attendee: { name?: string; email?: string }): string 
   return hasValidName ? `${attendee.name} <${attendee.email}>` : attendee.email || '';
 }
 
-// SHARED FUNCTION TO PROCESS AND WRITE MEETINGS  
+// SHARED FUNCTION TO PROCESS AND WRITE MEETINGS
 async function processAndWriteMeeting(data: MeetingData, existingMeeting?: ExistingMeeting): Promise<{ success: boolean; filePath?: string }> {
-  // Convert to Eastern timezone for folder structure (use direct toLocaleDateString with timezone)
-  const year = parseInt(data.startTime.toLocaleDateString('en-US', { year: 'numeric', timeZone: 'America/New_York' }));
-  const month = String(parseInt(data.startTime.toLocaleDateString('en-US', { month: 'numeric', timeZone: 'America/New_York' }))).padStart(2, '0');
-  const monthName = data.startTime.toLocaleDateString('en-US', { month: 'long', timeZone: 'America/New_York' });
-  const day = String(parseInt(data.startTime.toLocaleDateString('en-US', { day: 'numeric', timeZone: 'America/New_York' }))).padStart(2, '0');
-  const dayName = data.startTime.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/New_York' });
-  
-  // For filename timestamp, use Eastern timezone as well
+  // Convert to Eastern timezone for date components
   const easternDateStr = data.startTime.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-  const easternTimeStr = data.startTime.toLocaleTimeString('en-US', { 
-    hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' 
-  }).replace(':', '');
-  const dateStr = `${easternDateStr} ${easternTimeStr}`;
+  const dayName = data.startTime.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/New_York' });
 
   // Use existing file path if updating, otherwise create new path
   let filePath: string;
-  
+
   if (existingMeeting) {
     // Update existing scheduled meeting file
     filePath = existingMeeting.filePath;
   } else {
-    // Create new file path
-    const cleanTitle = data.title.replace(/[^\w\s-]/g, '').replace(/\s+/g, ' ').trim();
+    // Create new file path with flat structure: YYYY-MM-DD-DDD-Title--hash.md
+    const cleanTitle = data.title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').trim();
     const shortId = data.id.substring(0, 8);
-    const filename = `${dateStr} ${cleanTitle} -- ${shortId}.md`;
-    filePath = join(VAULT_PATH, String(year), `${month}-${monthName}`, `${day}-${dayName}`, filename);
+    const filename = `${easternDateStr}-${dayName}-${cleanTitle}--${shortId}.md`;
+    filePath = join(VAULT_PATH, filename);
 
     // Skip if file exists
     try {
@@ -370,6 +392,7 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
   const frontmatter: Record<string, any> = {
     title: data.title,
     date: data.startTime.toISOString().split('T')[0],
+    day: dayName,
     attendees: data.attendees,
     organizer: data.organizer,
     location: data.location,
@@ -378,6 +401,7 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
     duration_min: data.durationMin || 0,
     area: '',
     source: 'granola',
+    source_id: data.id,
     status: data.status,
     privacy: 'internal',
     calendar_event_id: data.id,
@@ -418,8 +442,8 @@ ${data.transcript}` : ''}`
   // Write file
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, markdown, 'utf-8');
-  
-  console.log(data.status === 'filed' ? `✓ ${data.title}` : `📅 ${data.title} (${dateStr})`);
+
+  console.log(data.status === 'filed' ? `✓ ${data.title}` : `📅 ${data.title} (${easternDateStr})`);
   return { success: true, filePath };
 }
 
@@ -451,12 +475,8 @@ async function main(): Promise<void> {
   const existingMeetings = await indexVaultMeetings(VAULT_PATH);
   console.log(`   Found ${existingMeetings.length} existing meetings`);
 
-  // 2. GET AUTH TOKEN
-  const tokenData = JSON.parse(await readFile(TOKEN_PATH, 'utf-8'));
-  const tokens = JSON.parse(tokenData.workos_tokens);
-  const token = tokens.access_token;
-  
-  if (!token) throw new Error('No auth token found');
+  // 2. GET AUTH TOKEN (auto-refreshes if expired)
+  const token = await getValidToken();
 
   // 3. FETCH PAST/PROCESSED MEETINGS FROM API
   console.log('\n📥 Fetching processed meetings from API...');
@@ -464,7 +484,9 @@ async function main(): Promise<void> {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'User-Agent': 'Granola/1.0',
+      'X-Client-Version': '1.0.0'
     },
     body: JSON.stringify({ limit: config.meetingsLimit })
   });
@@ -476,7 +498,17 @@ async function main(): Promise<void> {
     throw new Error(error);
   }
 
-  const meetings: GranolaDoc[] = await docsResponse.json();
+  const docsData = await docsResponse.json();
+  // Handle both direct array and wrapped { documents: [...] } response
+  const meetings: GranolaDoc[] = Array.isArray(docsData) ? docsData : (docsData.documents || docsData.docs || []);
+
+  // Debug: log response structure if not an array
+  if (!Array.isArray(docsData)) {
+    console.log(`   API response keys: ${Object.keys(docsData).join(', ')}`);
+    if (docsData.message) {
+      console.log(`   API message: ${docsData.message}`);
+    }
+  }
   console.log(`   Found ${meetings.length} processed meetings`);
 
   // API should ALWAYS return past meetings
