@@ -33,5 +33,5 @@
 
 ## Security & Configuration Tips
 - Do not commit `.env`, tokens, or real vault paths (`.gitignore` enforces this).
-- Required env: `GRANOLA_AUTH_PATH`, `OBSIDIAN_VAULT_MEETINGS_PATH`. Optional: `GRANOLA_MEETINGS_LIMIT`, `SYNC_TRANSCRIPT`, Pushover keys, external processing flags.
+- Required env: `GRANOLA_API_KEY`, `OBSIDIAN_VAULT_MEETINGS_PATH`. Optional: `GRANOLA_MEETINGS_LIMIT`, `SYNC_TRANSCRIPT`, Pushover keys, external processing flags.
 - When experimenting, use a disposable vault path to avoid overwriting real notes.

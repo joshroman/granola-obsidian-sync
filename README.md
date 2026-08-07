@@ -40,7 +40,7 @@ cp .env.example .env
 Edit `.env` with required settings:
 
 ### Required
-- `GRANOLA_AUTH_PATH`: Path to Granola's supabase.json auth file (default: `~/Library/Application Support/Granola/supabase.json`)
+- `GRANOLA_API_KEY`: Granola public API key (`grn_...`). Create in the Granola app: Settings → Connectors → API keys. Requires a Business or Enterprise plan.
 - `OBSIDIAN_VAULT_MEETINGS_PATH`: Absolute path to meetings directory in your Obsidian vault
 
 ### Optional
@@ -116,7 +116,7 @@ Add to crontab with `crontab -e`:
 ## How It Works
 
 1. **Index Vault**: Scans existing meeting files to build index for deduplication
-2. **Authentication**: Reads auth token from Granola app support directory
+2. **Authentication**: Static `grn_` API key sent as a Bearer token
 3. **Fetch Meetings**: Gets processed meetings from Granola API (configurable limit)
 4. **Panel Validation**: Only processes meetings that have panels (structured content)
 5. **Content Processing**: 

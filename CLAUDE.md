@@ -26,10 +26,11 @@ bun sync.ts
 
 ### Configuration
 All paths and tokens are configured via environment variables in `.env`:
-- **GRANOLA_AUTH_PATH**: Path to Granola's supabase.json auth file
+- **GRANOLA_API_KEY**: Granola public API key (`grn_...`). Create in the Granola app under Settings → Connectors → API keys. Requires a Business or Enterprise plan.
 - **OBSIDIAN_VAULT_MEETINGS_PATH**: Where meeting notes are saved in Obsidian
 - **PUSHOVER_USER_KEY** & **PUSHOVER_API_TOKEN**: Optional error notifications
-- **API Base**: `https://api.granola.ai/v1` (hardcoded as it's unlikely to change)
+- **API Base**: `https://public-api.granola.ai/v1` (override with `GRANOLA_API_BASE` for local testing)
+- **DRY_RUN**: Set to `true` to log what would be written without touching the vault
 
 ### File Organization
 - Main directory: Keep clean with only essential files
@@ -38,7 +39,7 @@ All paths and tokens are configured via environment variables in `.env`:
 
 ## Sync Behavior
 
-1. Reads auth token from Granola app support directory
+1. Authenticates with a static `grn_` API key from `GRANOLA_API_KEY`
 2. Fetches past meetings from Granola API (configurable limit, default 50)
 3. For each meeting with transcript:
    - Skips solo meetings and meetings without transcripts
@@ -65,9 +66,22 @@ The sync can be scheduled via:
 
 ## API Endpoints Used
 
-- `POST /v1/get-documents` - Fetch meeting list
-- `POST /v1/get-document-metadata` - Get meeting metadata
-- `POST /v1/get-document-transcript` - Get meeting transcript
+Official public API (https://docs.granola.ai/introduction):
+
+- `GET /v1/notes` - List notes, cursor-paginated (`page_size` max 30, `cursor`, `created_after`)
+- `GET /v1/notes/{id}?include=transcript` - Full note: attendees, `summary_markdown`, transcript
+
+Rate limits: 5 req/sec sustained (300/min), 25 burst per 5s. The sync paces itself
+at ~4 req/sec. The API only returns notes that already have a generated AI summary.
+
+### Migration note (Aug 2026)
+
+The sync previously scraped a JWT out of Granola's local `supabase.json`. Granola
+encrypted that storage, which broke auth entirely (`ENOENT`, errno -2). Note IDs
+also changed from UUIDs to `not_...`, so meetings synced before the migration
+cannot be matched by ID. `dedupKey()` in `sync.ts` falls back to a
+date + normalized-title match to prevent re-syncing the pre-migration backlog as
+duplicates. Do not remove that fallback.
 
 ## Development Notes
 

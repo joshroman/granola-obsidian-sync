@@ -40,7 +40,7 @@ bun install
     cp .env.example .env
     ```
 2.  Edit the `.env` file with your specific paths and API tokens. The following variables are required:
-    *   `GRANOLA_AUTH_PATH`: Path to Granola's `supabase.json` authentication file.
+    *   `GRANOLA_API_KEY`: Granola public API key (`grn_...`) from Settings → Connectors → API keys.
     *   `OBSIDIAN_VAULT_MEETINGS_PATH`: The absolute path to the meetings directory within your Obsidian vault.
 
 ### Running the Sync
