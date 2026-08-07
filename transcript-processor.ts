@@ -169,6 +169,15 @@ function formatTranscript(segments: ProcessedSegment[]): string {
 
 // MEETING FILTERING FUNCTIONS
 
+/**
+ * A '#transcript' directive in a meeting title forces the transcript to be
+ * synced and overrides the solo/empty skip checks. Defined here and re-exported
+ * to sync.ts so the pattern has a single definition.
+ */
+export function titleHasTranscriptTag(title: string): boolean {
+  return /(\s|^)#transcript(\b|[^\w])/i.test(title);
+}
+
 // Read lazily rather than at module load. ES imports are hoisted, so this
 // module is evaluated before sync.ts gets to load the shared automation config
 // — binding OWNER_EMAILS eagerly meant a value set there was silently ignored
@@ -199,7 +208,7 @@ export function shouldSkipPastMeeting(meeting: {
   title?: string;
 }): { skip: boolean; reason?: string } {
   // If directive tag is present, never skip based on solo/empty checks
-  if (meeting.title && /(\s|^)#transcript(\b|[^\w])/i.test(meeting.title)) {
+  if (meeting.title && titleHasTranscriptTag(meeting.title)) {
     return { skip: false };
   }
 

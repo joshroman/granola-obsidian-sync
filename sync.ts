@@ -7,7 +7,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import matter from 'gray-matter';
-import { processTranscript, shouldSkipPastMeeting } from './transcript-processor';
+import { processTranscript, shouldSkipPastMeeting, titleHasTranscriptTag } from './transcript-processor';
 
 // --- CONFIGURATION ---
 // All user-configurable values are sourced from environment variables.
@@ -191,7 +191,6 @@ interface MeetingData {
   attendees: string[];
   organizer: string;
   location: string;
-  status: 'filed' | 'scheduled';
   transcript?: string;
   meetingUrl?: string;
   durationMin?: number;
@@ -232,10 +231,6 @@ function normalizeTitle(title: string): string {
 }
 
 // CHECK IF TRANSCRIPT SHOULD BE SYNCED FOR THIS MEETING
-function titleHasTranscriptTag(title: string): boolean {
-  return /(\s|^)#transcript(\b|[^\w])/i.test(title);
-}
-
 function stripTranscriptTag(title: string): string {
   // Remove '#transcript' token, collapse spaces, and tidy spaces before punctuation
   let s = title.replace(/(^|\s)#transcript(\b)/ig, '$1');
@@ -270,13 +265,6 @@ function shouldSyncTranscript(title: string): boolean {
   // Check if any filter matches the title (case-insensitive)
   const titleLower = title.toLowerCase();
   return config.transcriptTitleFilter.some(filter => titleLower.includes(filter));
-}
-
-// TIME WINDOW MATCHING (12 hours)
-function isWithinTimeWindow(time1: Date, time2: Date): boolean {
-  const diffMs = Math.abs(time1.getTime() - time2.getTime());
-  const diffHours = diffMs / (1000 * 60 * 60);
-  return diffHours <= 12;
 }
 
 // VAULT INDEXING - SCAN EXISTING MEETING FILES
@@ -321,27 +309,6 @@ async function indexVaultMeetings(vaultPath: string): Promise<ExistingMeeting[]>
   }
 
   return meetings;
-}
-
-// FIND MATCHING SCHEDULED MEETING
-function findMatchingScheduledMeeting(
-  filedMeeting: { title: string; startTime: Date }, 
-  existingMeetings: ExistingMeeting[]
-): ExistingMeeting | null {
-  const normalizedTitle = normalizeTitle(filedMeeting.title);
-  
-  for (const existing of existingMeetings) {
-    if (existing.status !== 'scheduled') continue;
-    
-    const existingNormalizedTitle = normalizeTitle(existing.title);
-    
-    if (existingNormalizedTitle === normalizedTitle && 
-        isWithinTimeWindow(filedMeeting.startTime, existing.startTime)) {
-      return existing;
-    }
-  }
-  
-  return null;
 }
 
 // PUSHOVER NOTIFICATION - FIRE AND FORGET
@@ -450,32 +417,24 @@ function normalizeAttendee(attendee: { name?: string; email?: string }): string 
 }
 
 // SHARED FUNCTION TO PROCESS AND WRITE MEETINGS
-async function processAndWriteMeeting(data: MeetingData, existingMeeting?: ExistingMeeting): Promise<{ success: boolean; filePath?: string }> {
+async function processAndWriteMeeting(data: MeetingData): Promise<{ success: boolean; filePath?: string }> {
   // Convert to Eastern timezone for date components
   const easternDateStr = easternDate(data.startTime);
   const dayName = data.startTime.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/New_York' });
 
-  // Use existing file path if updating, otherwise create new path
-  let filePath: string;
+  // Flat structure: YYYY-MM-DD-DDD-Title--hash.md
+  const cleanTitle = data.title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').trim();
+  // Strip the `not_` prefix so the suffix carries 8 chars of real entropy
+  const shortId = data.id.replace(/^not_/, '').substring(0, 8);
+  const filename = `${easternDateStr}-${dayName}-${cleanTitle}--${shortId}.md`;
+  const filePath = join(VAULT_PATH, filename);
 
-  if (existingMeeting) {
-    // Update existing scheduled meeting file
-    filePath = existingMeeting.filePath;
-  } else {
-    // Create new file path with flat structure: YYYY-MM-DD-DDD-Title--hash.md
-    const cleanTitle = data.title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').trim();
-    // Strip the `not_` prefix so the suffix carries 8 chars of real entropy
-    const shortId = data.id.replace(/^not_/, '').substring(0, 8);
-    const filename = `${easternDateStr}-${dayName}-${cleanTitle}--${shortId}.md`;
-    filePath = join(VAULT_PATH, filename);
-
-    // Skip if file exists
-    try {
-      await access(filePath);
-      return { success: false };
-    } catch {
-      // File doesn't exist, continue
-    }
+  // Skip if file exists
+  try {
+    await access(filePath);
+    return { success: false };
+  } catch {
+    // File doesn't exist, continue
   }
 
   // Create frontmatter
@@ -492,13 +451,11 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
     area: '',
     source: 'granola',
     source_id: data.id,
-    status: data.status,
+    status: 'filed',
     privacy: 'internal',
     calendar_event_id: data.id,
     meeting_url: data.meetingUrl || '',
-    transcript_url: data.status === 'filed'
-      ? (data.webUrl || `https://notes.granola.ai/d/${data.id}`)
-      : ''
+    transcript_url: data.webUrl || `https://notes.granola.ai/d/${data.id}`
   };
 
   // Preserve directive in frontmatter tags
@@ -506,9 +463,7 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
     frontmatter.tags = data.tags;
   }
 
-  // Create content based on status
-  const content = data.status === 'filed'
-    ? `# ${data.title}
+  const content = `# ${data.title}
 
 ## Agenda
 
@@ -519,16 +474,9 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
 ${data.panelContent || ''}${data.transcript ? `
 
 ## Transcript
-${data.transcript}` : ''}`
-    : `# ${data.title}
+${data.transcript}` : ''}`;
 
-## Agenda
 
-## Notes
-
-## Action Items
-`;
-  
   const markdown = matter.stringify(content, frontmatter);
 
   if (config.dryRun) {
@@ -540,7 +488,7 @@ ${data.transcript}` : ''}`
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, markdown, 'utf-8');
 
-  console.log(data.status === 'filed' ? `✓ ${data.title}` : `📅 ${data.title} (${easternDateStr})`);
+  console.log(`✓ ${data.title}`);
   return { success: true, filePath };
 }
 
@@ -695,30 +643,16 @@ async function main(): Promise<void> {
         .filter(Boolean),
       organizer: note.owner?.name || note.calendar_event?.organiser || '',
       location: '',
-      status: 'filed',
       transcript: finalTranscript,
       panelContent,
       webUrl: note.web_url,
       tags: hasTranscriptDirective ? ['#transcript'] : undefined
     };
     
-    // DEDUPLICATION: Check for matching scheduled meeting
-    const matchingScheduledMeeting = findMatchingScheduledMeeting(meetingData, existingMeetings);
-    
-    if (matchingScheduledMeeting) {
-      console.log(`🔄 Updating scheduled meeting: ${rawTitle} → ${matchingScheduledMeeting.filePath}`);
-      const result = await processAndWriteMeeting(meetingData, matchingScheduledMeeting);
-      if (result.success && result.filePath) {
-        processedCount++;
-        newlyProcessedMeetings.push({ filePath: result.filePath, data: meetingData });
-      }
-    } else {
-      // No matching scheduled meeting, create new filed meeting
-      const result = await processAndWriteMeeting(meetingData);
-      if (result.success && result.filePath) {
-        processedCount++;
-        newlyProcessedMeetings.push({ filePath: result.filePath, data: meetingData });
-      }
+    const result = await processAndWriteMeeting(meetingData);
+    if (result.success && result.filePath) {
+      processedCount++;
+      newlyProcessedMeetings.push({ filePath: result.filePath, data: meetingData });
     }
   }
 
