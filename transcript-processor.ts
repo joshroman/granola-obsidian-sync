@@ -111,12 +111,23 @@ function toProcessedSegment(segment: TranscriptSegment): ProcessedSegment {
 }
 
 /**
- * Remove duplicate segments within time windows
+ * Remove repeated segments within a short time window.
+ *
+ * This used to fuzzy-match on a 0.68 similarity threshold to undo the echo the
+ * old private API produced, where the same utterance arrived on both the
+ * microphone and system audio streams. The public API diarizes server-side and
+ * returns pre-attributed segments, so that echo is effectively gone — measured
+ * at 3 cross-source duplicate pairs across 4 meetings.
+ *
+ * What the fuzzy matching did instead was delete real content: across 2,464
+ * live segments it removed 12, and half of those removals crossed a speaker
+ * boundary. It dropped "Nausea is here." because someone else said "Fatigue is
+ * here.", and dropped a statement because another participant paraphrased it
+ * back. Only byte-identical repeats from the same speaker are removed now.
  */
-function deduplicateSegments(
+export function deduplicateSegments(
   segments: ProcessedSegment[],
-  timeWindowMs: number = 4500,
-  similarityThreshold: number = 0.68
+  timeWindowMs: number = 4500
 ): ProcessedSegment[] {
   if (segments.length === 0) return [];
 
@@ -128,79 +139,19 @@ function deduplicateSegments(
     const segment = segments[i];
     const windowEnd = segment.startTime + timeWindowMs;
 
-    // Check subsequent segments within time window
     for (let j = i + 1; j < segments.length; j++) {
       if (toRemove.has(j)) continue;
 
       const other = segments[j];
       if (other.startTime > windowEnd) break;
 
-      const similarity = calculateSimilarity(segment.text, other.text);
-
-      if (similarity >= similarityThreshold) {
-        // Prefer microphone source over system
-        if (segment.source === 'microphone' && other.source === 'system') {
-          toRemove.add(j);
-        } else if (segment.source === 'system' && other.source === 'microphone') {
-          toRemove.add(i);
-          break;
-        } else {
-          // Keep the longer text
-          if (segment.text.length >= other.text.length) {
-            toRemove.add(j);
-          } else {
-            toRemove.add(i);
-            break;
-          }
-        }
+      if (other.speaker === segment.speaker && other.text === segment.text) {
+        toRemove.add(j);
       }
     }
   }
 
   return segments.filter((_, i) => !toRemove.has(i));
-}
-
-/**
- * Calculate text similarity (0.0 to 1.0)
- */
-function calculateSimilarity(text1: string, text2: string): number {
-  const s1 = text1.toLowerCase();
-  const s2 = text2.toLowerCase();
-
-  if (s1 === s2) return 1.0;
-  if (!s1 || !s2) return 0.0;
-
-  // Check containment
-  if (s1.includes(s2) || s2.includes(s1)) {
-    const minLen = Math.min(s1.length, s2.length);
-    const maxLen = Math.max(s1.length, s2.length);
-    return minLen / maxLen + 0.2; // Bonus for containment
-  }
-
-  // Simple character-based similarity
-  const lcs = longestCommonSubsequence(s1, s2);
-  return lcs / Math.max(s1.length, s2.length);
-}
-
-/**
- * Calculate longest common subsequence length
- */
-function longestCommonSubsequence(s1: string, s2: string): number {
-  const m = s1.length;
-  const n = s2.length;
-  const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (s1[i - 1] === s2[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-      }
-    }
-  }
-
-  return dp[m][n];
 }
 
 /**
