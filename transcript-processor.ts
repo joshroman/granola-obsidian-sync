@@ -14,11 +14,6 @@ import 'dotenv/config';
 
 interface TranscriptSegment {
   text?: string;
-  // Legacy private-API shape
-  source?: string;
-  start_timestamp?: string;
-  end_timestamp?: string;
-  // Official public-API shape
   speaker?: {
     source?: string;      // 'microphone' | 'speaker'
     attribution?: string; // 'me' | 'them'
@@ -32,30 +27,14 @@ interface ProcessedSegment {
   text: string;
   speaker: string;
   startTime: number;
-  endTime: number;
-  source: string;
 }
 
 /**
  * Process raw transcript data from Granola API
  * Returns formatted markdown with speaker labels
  */
-export function processTranscript(transcriptData: any): string {
-  // Handle both string transcripts and structured segment data
-  if (typeof transcriptData === 'string') {
-    return transcriptData; // Pass through if already processed
-  }
-
-  // Extract segments array from various possible structures
-  const segments: TranscriptSegment[] = 
-    Array.isArray(transcriptData) ? transcriptData :  // Direct array case
-    transcriptData?.segments || 
-    transcriptData?.transcript?.segments || 
-    [];
-
-  if (!segments || segments.length === 0) {
-    return transcriptData?.transcript || '';
-  }
+export function processTranscript(segments: TranscriptSegment[] | null | undefined): string {
+  if (!segments || segments.length === 0) return '';
 
   // Convert to processed segments with speaker info
   const processed = segments
@@ -74,18 +53,7 @@ export function processTranscript(transcriptData: any): string {
  * Convert raw segment to processed segment with speaker identification
  */
 function toProcessedSegment(segment: TranscriptSegment): ProcessedSegment {
-  // Timestamps: public API uses start_time/end_time, legacy used *_timestamp
-  const rawStart = segment.start_time || segment.start_timestamp;
-  const rawEnd = segment.end_time || segment.end_timestamp;
-
-  const startTime = rawStart ? new Date(rawStart).getTime() : 0;
-  const endTime = rawEnd ? new Date(rawEnd).getTime() : startTime;
-
-  // Audio source. The public API nests this under `speaker` and renames the
-  // remote source from 'system' to 'speaker'; normalize both to the legacy
-  // values so the fallback logic below keeps working unchanged.
-  const rawSource = segment.speaker?.source || segment.source || '';
-  const source = rawSource === 'speaker' ? 'system' : rawSource;
+  const startTime = segment.start_time ? new Date(segment.start_time).getTime() : 0;
 
   // Determine the speaker label.
   //
@@ -107,9 +75,9 @@ function toProcessedSegment(segment: TranscriptSegment): ProcessedSegment {
     speaker = name;
   } else if (attribution === 'them') {
     speaker = 'Them';
-  } else if (source === 'microphone') {
+  } else if (segment.speaker?.source === 'microphone') {
     speaker = 'Me';
-  } else if (source === 'system') {
+  } else if (segment.speaker?.source === 'speaker') {
     speaker = 'Them';
   } else {
     speaker = 'Unknown';
@@ -118,9 +86,7 @@ function toProcessedSegment(segment: TranscriptSegment): ProcessedSegment {
   return {
     text: segment.text!.trim(),
     speaker,
-    startTime,
-    endTime,
-    source
+    startTime
   };
 }
 

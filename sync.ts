@@ -6,12 +6,8 @@ import { readFile, writeFile, mkdir, access, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import matter from 'gray-matter';
 import { processTranscript, shouldSkipPastMeeting } from './transcript-processor';
-
-const execFileAsync = promisify(execFile);
 
 // --- CONFIGURATION ---
 // All user-configurable values are sourced from environment variables.
