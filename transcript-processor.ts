@@ -83,22 +83,36 @@ function toProcessedSegment(segment: TranscriptSegment): ProcessedSegment {
 
   // Audio source. The public API nests this under `speaker` and renames the
   // remote source from 'system' to 'speaker'; normalize both to the legacy
-  // values so the dedup logic below keeps working unchanged.
+  // values so the fallback logic below keeps working unchanged.
   const rawSource = segment.speaker?.source || segment.source || '';
   const source = rawSource === 'speaker' ? 'system' : rawSource;
 
-  // Determine speaker label. The public API states attribution explicitly,
-  // which is more reliable than inferring it from the audio source.
-  let speaker = 'Unknown';
+  // Determine the speaker label.
+  //
+  // The public API diarizes remote participants and names them, so a group call
+  // resolves to individual people rather than one undifferentiated "Them". Names
+  // are used verbatim — no fuzzy merging of variants, since collapsing two
+  // similar labels risks merging two different people, which is worse than
+  // listing one person twice.
+  //
+  // The local speaker is never named by the API, so it stays "Me" rather than
+  // mixing "Me" and a configured name within a single transcript.
   const attribution = segment.speaker?.attribution;
+  const name = segment.speaker?.name?.trim();
+
+  let speaker: string;
   if (attribution === 'me') {
     speaker = 'Me';
+  } else if (name) {
+    speaker = name;
   } else if (attribution === 'them') {
     speaker = 'Them';
   } else if (source === 'microphone') {
     speaker = 'Me';
   } else if (source === 'system') {
     speaker = 'Them';
+  } else {
+    speaker = 'Unknown';
   }
 
   return {
