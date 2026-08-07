@@ -159,6 +159,24 @@ async function listNotes(limit: number): Promise<NoteSummary[]> {
   return notes.slice(0, limit);
 }
 
+// Wall-clock minutes covered by a transcript, or undefined when it can't be
+// determined. Undefined rather than 0 so callers can tell "no data" apart from
+// "genuinely instantaneous" and skip the length check instead of guessing.
+function transcriptSpanMinutes(segments: TranscriptSegmentApi[] | null | undefined): number | undefined {
+  if (!segments || segments.length === 0) return undefined;
+
+  const stamps = segments
+    .flatMap(s => [s.start_time, s.end_time])
+    .filter((v): v is string => Boolean(v))
+    .map(v => new Date(v).getTime())
+    .filter(n => !isNaN(n));
+
+  if (stamps.length < 2) return undefined;
+  // Deliberately not rounded: a 25-second recording must stay below the
+  // short-meeting threshold rather than rounding down to a falsy 0.
+  return (Math.max(...stamps) - Math.min(...stamps)) / 60000;
+}
+
 // GET SINGLE NOTE - includes attendees, summary and (optionally) transcript
 async function getNote(id: string, includeTranscript: boolean): Promise<Note> {
   return await apiGet(`/notes/${id}`, includeTranscript ? { include: 'transcript' } : {});
@@ -611,12 +629,18 @@ async function main(): Promise<void> {
 
     // Filter out solo/empty meetings
     const processedTranscript = processTranscript(note.transcript);
+
+    // Duration from the transcript's own span rather than the calendar. A
+    // scheduled block says what was booked; the span says what actually
+    // happened, and it can't be skewed by a malformed calendar event.
+    const spanMinutes = transcriptSpanMinutes(note.transcript);
     const hasTranscriptDirective = titleHasTranscriptTag(rawTitle);
     const cleanedTitle = hasTranscriptDirective ? stripTranscriptTag(rawTitle) : rawTitle;
     const attendees = note.attendees || [];
     const skipCheck = shouldSkipPastMeeting({
       attendees: attendees.map(a => ({ name: a.name || '', email: a.email })),
       transcript: processedTranscript,
+      durationInMinutes: spanMinutes,
       title: rawTitle
     });
 

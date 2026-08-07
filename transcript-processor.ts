@@ -169,11 +169,23 @@ function formatTranscript(segments: ProcessedSegment[]): string {
 
 // MEETING FILTERING FUNCTIONS
 
-const OWNER_EMAILS = new Set(
-  (process.env.OWNER_EMAILS || 'josh@omaihq.com,josh@mindshiftrecovery.org,joshroman@gmail.com')
-    .split(',')
-    .map(email => email.trim())
-);
+// Read lazily rather than at module load. ES imports are hoisted, so this
+// module is evaluated before sync.ts gets to load the shared automation config
+// — binding OWNER_EMAILS eagerly meant a value set there was silently ignored
+// and the hardcoded defaults were used instead, with no error.
+let ownerEmailsCache: Set<string> | null = null;
+
+function ownerEmails(): Set<string> {
+  if (!ownerEmailsCache) {
+    ownerEmailsCache = new Set(
+      (process.env.OWNER_EMAILS || 'josh@omaihq.com,josh@mindshiftrecovery.org,joshroman@gmail.com')
+        .split(',')
+        .map(email => email.trim())
+        .filter(Boolean)
+    );
+  }
+  return ownerEmailsCache;
+}
 
 
 /**
@@ -199,7 +211,8 @@ export function shouldSkipPastMeeting(meeting: {
   }
   
   // Check if all attendees are owner's email addresses
-  const nonOwnerAttendees = attendees.filter(a => a.email && !OWNER_EMAILS.has(a.email));
+  const owners = ownerEmails();
+  const nonOwnerAttendees = attendees.filter(a => a.email && !owners.has(a.email));
   
   if (nonOwnerAttendees.length === 0) {
     return { skip: true, reason: 'Solo meeting (only owner\'s emails)' };
@@ -211,8 +224,10 @@ export function shouldSkipPastMeeting(meeting: {
     return { skip: true, reason: 'Empty transcript' };
   }
   
-  // Check for very short duration (less than 2 minutes)
-  if (meeting.durationInMinutes && meeting.durationInMinutes < 2) {
+  // Check for very short duration (less than 2 minutes). Tested against
+  // undefined rather than truthiness: a sub-minute recording is exactly the
+  // case this filters, and `0 && ...` would wave it through.
+  if (meeting.durationInMinutes !== undefined && meeting.durationInMinutes < 2) {
     return { skip: true, reason: 'Too short (less than 2 minutes)' };
   }
   
