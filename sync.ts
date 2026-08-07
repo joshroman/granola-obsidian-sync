@@ -48,11 +48,6 @@ const config = {
   // Meeting processing config
   enableMeetingProcessing: process.env.ENABLE_MEETING_PROCESSING === 'true',
   vaultOpsScriptPath: process.env.VAULT_OPS_SCRIPT_PATH,
-  // Pushover config for future use
-  pushover: {
-    userKey: process.env.PUSHOVER_USER_KEY,
-    apiToken: process.env.PUSHOVER_API_TOKEN,
-  },
 };
 
 // Check external script exists if processing is enabled (log but don't fail)
@@ -311,25 +306,6 @@ async function indexVaultMeetings(vaultPath: string): Promise<ExistingMeeting[]>
   return meetings;
 }
 
-// PUSHOVER NOTIFICATION - FIRE AND FORGET
-function sendPushover(title: string, message: string): void {
-  if (!config.pushover.userKey || !config.pushover.apiToken) return;
-  
-  fetch('https://api.pushover.net/1/messages.json', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      token: config.pushover.apiToken,
-      user: config.pushover.userKey,
-      title,
-      message,
-      priority: '1'
-    })
-  }).catch(err => {
-    console.error(`Pushover failed: ${err.message}`);
-  });
-}
-
 // MEETING PROCESSING FUNCTION
 async function processSingleMeeting(): Promise<void> {
   if (!config.enableMeetingProcessing) return;
@@ -517,24 +493,19 @@ async function main(): Promise<void> {
   try {
     meetings = await listNotes(config.meetingsLimit);
   } catch (err: any) {
-    const error = `Notes API failed: ${err.message}`;
-    sendPushover('Granola Sync FAILED', error);
-    await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for Pushover
-    throw new Error(error);
+    throw new Error(`Notes API failed: ${err.message}`);
   }
 
   console.log(`   Found ${meetings.length} processed meetings`);
 
   // API should ALWAYS return past meetings
   if (meetings.length === 0) {
-    const error = 'API returned 0 meetings - API is likely broken';
-    sendPushover('Granola Sync FAILED', error);
-    await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for Pushover
-    throw new Error(error);
+    throw new Error('API returned 0 meetings - API is likely broken');
   }
 
   let processedCount = 0;
   let skippedCount = 0;
+  let warningCount = 0;
   const newlyProcessedMeetings: { filePath: string; data: MeetingData }[] = [];
 
   // 4. PROCESS PAST MEETINGS (FILED MEETINGS WITH DEDUPLICATION)
@@ -569,9 +540,8 @@ async function main(): Promise<void> {
       await sleep(REQUEST_INTERVAL_MS);
       note = await getNote(summary.id, true);
     } catch (error: any) {
-      const message = `Failed to fetch note for ${rawTitle} - skipping (${error.message})`;
-      console.error(message);
-      sendPushover('Granola Sync Warning', message);
+      console.error(`⚠️  Failed to fetch note for ${rawTitle} - skipping (${error.message})`);
+      warningCount++;
       continue;
     }
 
@@ -666,21 +636,24 @@ async function main(): Promise<void> {
   const endTimestamp = new Date().toISOString();
   console.log(`\n[${endTimestamp}] SUCCESS: ${processedCount} meetings processed`);
   if (skippedCount > 0) {
-    console.log(`⏭️  Skipped: ${skippedCount} empty meetings (no transcript or panels)`);
+    console.log(`⏭️  Skipped: ${skippedCount} empty meetings (no transcript or summary)`);
+  }
+  // Surfaced in the run summary rather than notified separately: the wrapper
+  // tees stdout to the log, and a note that fails to fetch is retried on the
+  // next run anyway.
+  if (warningCount > 0) {
+    console.log(`⚠️  Warnings: ${warningCount} notes could not be fetched`);
   }
 }
 
 // EXECUTION
+// Failures exit non-zero. sync-with-timeout.sh detects that and raises the
+// alert through the shared notify.sh, which covers both Slack and Pushover —
+// so this only needs to report and exit.
 main().catch(error => {
   const errorTimestamp = new Date().toISOString();
   console.error(`[${errorTimestamp}] === SYNC FAILED ===`);
-  console.error(error);
+  console.error(error instanceof Error ? error.stack || error.message : String(error));
   console.error('===================');
-  
-  // Send Pushover with stack trace
-  const errorMessage = error instanceof Error ? error.stack || error.message : String(error);
-  sendPushover('Granola Sync CRASHED', `Script crashed at ${errorTimestamp}\n\n${errorMessage}`);
-  
-  // Give Pushover time to send before exiting
-  setTimeout(() => process.exit(1), 1000);
+  process.exit(1);
 });
