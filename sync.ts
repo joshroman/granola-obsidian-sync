@@ -74,18 +74,15 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // TYPES — mirror the documented public API schema
 interface NoteSummary {
   id: string;
-  object: 'note';
   title: string | null;
   owner?: { name: string | null; email: string };
   created_at: string;
-  updated_at: string;
 }
 
 interface TranscriptSegmentApi {
   speaker?: {
     source?: 'microphone' | 'speaker';
     attribution?: 'me' | 'them';
-    diarization_label?: string;
     name?: string;
   };
   text: string;
@@ -96,10 +93,7 @@ interface TranscriptSegmentApi {
 interface Note extends NoteSummary {
   web_url?: string;
   calendar_event?: {
-    event_title?: string | null;
-    invitees?: Array<{ email: string }>;
     organiser?: string | null;
-    calendar_event_id?: string | null;
     scheduled_start_time?: string | null;
     scheduled_end_time?: string | null;
   };
@@ -185,9 +179,7 @@ interface MeetingData {
   endTime?: Date;
   attendees: string[];
   organizer: string;
-  location: string;
   transcript?: string;
-  meetingUrl?: string;
   durationMin?: number;
   panelContent?: string;
   tags?: string[];
@@ -198,7 +190,6 @@ interface MeetingData {
 interface ExistingMeeting {
   filePath: string;
   title: string;
-  startTime: Date;
   status: 'filed' | 'scheduled';
   id: string; // calendar_event_id from frontmatter
   date: string; // YYYY-MM-DD (Eastern) from frontmatter
@@ -286,7 +277,6 @@ async function indexVaultMeetings(vaultPath: string): Promise<ExistingMeeting[]>
           meetings.push({
             filePath,
             title: frontmatter.title || '',
-            startTime,
             status: frontmatter.status || 'scheduled',
             id: frontmatter.calendar_event_id,
             date: frontmatter.date
@@ -381,10 +371,6 @@ function hasContent(note: Note): boolean {
   return hasTranscriptContent || hasSummaryContent;
 }
 
-// CHECK IF MEETING IS IN THE PAST
-function isPastMeeting(startTime: Date): boolean {
-  return startTime < new Date();
-}
 
 // NORMALIZE ATTENDEE DATA FOR CONSISTENT FORMATTING
 function normalizeAttendee(attendee: { name?: string; email?: string }): string {
@@ -420,7 +406,9 @@ async function processAndWriteMeeting(data: MeetingData): Promise<{ success: boo
     day: dayName,
     attendees: data.attendees,
     organizer: data.organizer,
-    location: data.location,
+    // Retained as empty keys: nothing populates or reads them, but all 1,254
+    // existing notes carry them and the frontmatter shape should stay stable.
+    location: '',
     start_time: data.startTime.toISOString(),
     end_time: data.endTime?.toISOString() || '',
     duration_min: data.durationMin || 0,
@@ -430,7 +418,7 @@ async function processAndWriteMeeting(data: MeetingData): Promise<{ success: boo
     status: 'filed',
     privacy: 'internal',
     calendar_event_id: data.id,
-    meeting_url: data.meetingUrl || '',
+    meeting_url: '',
     transcript_url: data.webUrl || `https://notes.granola.ai/d/${data.id}`
   };
 
@@ -571,13 +559,13 @@ async function main(): Promise<void> {
     // Only include the transcript body if this meeting is configured for it
     const finalTranscript = wantsTranscript ? processedTranscript : '';
 
-    // CONTENT VALIDATION FOR PAST MEETINGS - Skip empty meetings
-    if (isPastMeeting(startTime)) {
-      if (!hasContent(note)) {
-        console.log(`⏭️  Skipping empty: ${rawTitle} (no transcript or summary)`);
-        skippedCount++;
-        continue;
-      }
+    // Skip empty meetings. The past-meeting guard this used to sit behind was
+    // always true — the API only returns notes that already have a generated
+    // summary, which means the meeting has happened.
+    if (!hasContent(note)) {
+      console.log(`⏭️  Skipping empty: ${rawTitle} (no transcript or summary)`);
+      skippedCount++;
+      continue;
     }
 
     // The public API returns the AI summary as markdown directly, replacing the
@@ -612,7 +600,6 @@ async function main(): Promise<void> {
         .map(a => normalizeAttendee({ name: a.name || undefined, email: a.email }))
         .filter(Boolean),
       organizer: note.owner?.name || note.calendar_event?.organiser || '',
-      location: '',
       transcript: finalTranscript,
       panelContent,
       webUrl: note.web_url,
