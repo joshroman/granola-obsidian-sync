@@ -14,9 +14,18 @@ import 'dotenv/config';
 
 interface TranscriptSegment {
   text?: string;
+  // Legacy private-API shape
   source?: string;
   start_timestamp?: string;
   end_timestamp?: string;
+  // Official public-API shape
+  speaker?: {
+    source?: string;      // 'microphone' | 'speaker'
+    attribution?: string; // 'me' | 'them'
+    name?: string;
+  };
+  start_time?: string;
+  end_time?: string;
 }
 
 interface ProcessedSegment {
@@ -65,18 +74,30 @@ export function processTranscript(transcriptData: any): string {
  * Convert raw segment to processed segment with speaker identification
  */
 function toProcessedSegment(segment: TranscriptSegment): ProcessedSegment {
-  const startTime = segment.start_timestamp 
-    ? new Date(segment.start_timestamp).getTime() 
-    : 0;
-  const endTime = segment.end_timestamp 
-    ? new Date(segment.end_timestamp).getTime() 
-    : startTime;
+  // Timestamps: public API uses start_time/end_time, legacy used *_timestamp
+  const rawStart = segment.start_time || segment.start_timestamp;
+  const rawEnd = segment.end_time || segment.end_timestamp;
 
-  // Determine speaker based on source
+  const startTime = rawStart ? new Date(rawStart).getTime() : 0;
+  const endTime = rawEnd ? new Date(rawEnd).getTime() : startTime;
+
+  // Audio source. The public API nests this under `speaker` and renames the
+  // remote source from 'system' to 'speaker'; normalize both to the legacy
+  // values so the dedup logic below keeps working unchanged.
+  const rawSource = segment.speaker?.source || segment.source || '';
+  const source = rawSource === 'speaker' ? 'system' : rawSource;
+
+  // Determine speaker label. The public API states attribution explicitly,
+  // which is more reliable than inferring it from the audio source.
   let speaker = 'Unknown';
-  if (segment.source === 'microphone') {
+  const attribution = segment.speaker?.attribution;
+  if (attribution === 'me') {
     speaker = 'Me';
-  } else if (segment.source === 'system') {
+  } else if (attribution === 'them') {
+    speaker = 'Them';
+  } else if (source === 'microphone') {
+    speaker = 'Me';
+  } else if (source === 'system') {
     speaker = 'Them';
   }
 
@@ -85,7 +106,7 @@ function toProcessedSegment(segment: TranscriptSegment): ProcessedSegment {
     speaker,
     startTime,
     endTime,
-    source: segment.source || ''
+    source
   };
 }
 

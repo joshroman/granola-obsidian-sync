@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import 'dotenv/config';
+import dotenv from 'dotenv';
 import { readFile, writeFile, mkdir, access, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
@@ -9,7 +10,6 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import matter from 'gray-matter';
 import { processTranscript, shouldSkipPastMeeting } from './transcript-processor';
-import { processPanels } from './panel-processor';
 
 const execFileAsync = promisify(execFile);
 
@@ -17,13 +17,22 @@ const execFileAsync = promisify(execFile);
 // All user-configurable values are sourced from environment variables.
 // See .env.example for details.
 
-const requiredEnvVars = [
-  'GRANOLA_AUTH_PATH',
-  'OBSIDIAN_VAULT_MEETINGS_PATH',
-];
-
 // Helper to resolve tilde (~) in paths
 const resolvePath = (p: string) => (p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
+
+// Shared secrets live alongside the other automation credentials. The local .env
+// is loaded first and wins; this only fills in what it does not define.
+const SHARED_ENV_PATH = resolvePath(
+  process.env.JOSH_AUTOMATIONS_ENV || '~/.config/josh-automations/.env'
+);
+if (existsSync(SHARED_ENV_PATH)) {
+  dotenv.config({ path: SHARED_ENV_PATH });
+}
+
+const requiredEnvVars = [
+  'GRANOLA_API_KEY',
+  'OBSIDIAN_VAULT_MEETINGS_PATH',
+];
 
 // Validate required environment variables
 for (const varName of requiredEnvVars) {
@@ -33,9 +42,11 @@ for (const varName of requiredEnvVars) {
 }
 
 const config = {
-  granolaAuthPath: resolvePath(process.env.GRANOLA_AUTH_PATH!),
+  granolaApiKey: process.env.GRANOLA_API_KEY!,
   obsidianVaultPath: resolvePath(process.env.OBSIDIAN_VAULT_MEETINGS_PATH!),
   meetingsLimit: parseInt(process.env.GRANOLA_MEETINGS_LIMIT || '50'),
+  // DRY_RUN=true reports what would be written without touching the vault
+  dryRun: process.env.DRY_RUN === 'true',
   syncTranscript: process.env.SYNC_TRANSCRIPT === 'true',
   transcriptTitleFilter: process.env.TRANSCRIPT_TITLE_FILTER?.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) || [],
   // Meeting processing config
@@ -57,90 +68,104 @@ if (config.enableMeetingProcessing) {
 
 // --- END CONFIGURATION ---
 
-const API_BASE = 'https://api.granola.ai/v1';
+// Official Granola public API (https://docs.granola.ai/introduction)
+// Auth is a static `grn_` key from Granola → Settings → Connectors → API keys.
+// GRANOLA_API_BASE exists so the sync can be pointed at a local mock in tests.
+const API_BASE = process.env.GRANOLA_API_BASE || 'https://public-api.granola.ai/v1';
 const VAULT_PATH = config.obsidianVaultPath;
-const TOKEN_PATH = config.granolaAuthPath;
 
-// TOKEN REFRESH - Decode JWT expiry and refresh via Granola API if needed
-function decodeJwtPayload(token: string): Record<string, any> {
-  const parts = token.split('.');
-  if (parts.length !== 3) return {};
-  const payload = Buffer.from(parts[1], 'base64url').toString('utf-8');
-  return JSON.parse(payload);
+// API limits: 30 notes/page max, 5 req/sec sustained (300/min), 25 burst per 5s.
+const PAGE_SIZE = 30;
+const REQUEST_INTERVAL_MS = 250; // ~4 req/sec, comfortably under the sustained limit
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// TYPES — mirror the documented public API schema
+interface NoteSummary {
+  id: string;
+  object: 'note';
+  title: string | null;
+  owner?: { name: string | null; email: string };
+  created_at: string;
+  updated_at: string;
 }
 
-function isTokenExpired(token: string, bufferSeconds = 300): boolean {
-  const payload = decodeJwtPayload(token);
-  if (!payload.exp) return true;
-  return Date.now() / 1000 > payload.exp - bufferSeconds;
+interface TranscriptSegmentApi {
+  speaker?: {
+    source?: 'microphone' | 'speaker';
+    attribution?: 'me' | 'them';
+    diarization_label?: string;
+    name?: string;
+  };
+  text: string;
+  start_time?: string;
+  end_time?: string;
 }
 
-async function getValidToken(): Promise<string> {
-  const raw = await readFile(TOKEN_PATH, 'utf-8');
-  const tokenData = JSON.parse(raw);
-  const tokens = JSON.parse(tokenData.workos_tokens);
-  const accessToken = tokens.access_token;
+interface Note extends NoteSummary {
+  web_url?: string;
+  calendar_event?: {
+    event_title?: string | null;
+    invitees?: Array<{ email: string }>;
+    organiser?: string | null;
+    calendar_event_id?: string | null;
+    scheduled_start_time?: string | null;
+    scheduled_end_time?: string | null;
+  };
+  attendees?: Array<{ name: string | null; email: string }>;
+  summary_text?: string;
+  summary_markdown?: string | null;
+  transcript?: TranscriptSegmentApi[] | null;
+}
 
-  if (!accessToken) throw new Error('No auth token found in supabase.json');
+// AUTHENTICATED REQUEST HELPER
+async function apiGet(path: string, params: Record<string, string> = {}): Promise<any> {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
 
-  if (!isTokenExpired(accessToken)) return accessToken;
-
-  // Token expired or expiring soon — refresh it
-  const refreshToken = tokens.refresh_token;
-  if (!refreshToken) throw new Error('No refresh token available — open Granola app to re-authenticate');
-
-  console.log('🔑 Access token expired, refreshing...');
-
-  const response = await fetch(`${API_BASE}/refresh-access-token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refresh_token: refreshToken })
+  const response = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${config.granolaApiKey}`,
+      'Accept': 'application/json'
+    }
   });
 
   if (!response.ok) {
     const body = await response.text().catch(() => '');
-    throw new Error(`Token refresh failed (${response.status}): ${body} — open Granola app to re-authenticate`);
+    throw new Error(`GET ${path} failed: ${response.status} ${response.statusText} ${body}`.trim());
   }
 
-  const newTokens = await response.json();
+  return await response.json();
+}
 
-  if (!newTokens.access_token) {
-    throw new Error('Token refresh returned no access_token — open Granola app to re-authenticate');
+// LIST NOTES - cursor-paginated, newest first
+async function listNotes(limit: number): Promise<NoteSummary[]> {
+  const notes: NoteSummary[] = [];
+  let cursor: string | null = null;
+
+  while (notes.length < limit) {
+    const params: Record<string, string> = {
+      page_size: String(Math.min(PAGE_SIZE, limit - notes.length))
+    };
+    if (cursor) params.cursor = cursor;
+
+    const page = await apiGet('/notes', params);
+    const batch: NoteSummary[] = page.notes || [];
+    notes.push(...batch);
+
+    if (!page.hasMore || !page.cursor || batch.length === 0) break;
+    cursor = page.cursor;
+    await sleep(REQUEST_INTERVAL_MS);
   }
 
-  // Write refreshed tokens back to supabase.json so Granola app stays in sync
-  tokenData.workos_tokens = JSON.stringify(newTokens);
-  await writeFile(TOKEN_PATH, JSON.stringify(tokenData), 'utf-8');
-
-  console.log('✅ Token refreshed successfully');
-  return newTokens.access_token;
+  return notes.slice(0, limit);
 }
 
-// Template identification for panel processing
-const TEMPLATE_SLUG = 'b491d27c-1106-4ebf-97c5-d5129742945c';
-
-// TYPES
-interface GranolaDoc {
-  id: string;
-  title: string;
-  created_at: string;
-  workspace?: { name: string };
-}
-
-interface DocMetadata {
-  attendees?: Array<{ name: string; email: string }>;
-  creator?: { name: string; email: string };
-  sharing_link_visibility?: string;
-}
-
-
-interface Panel {
-  id: string;
-  title: string;
-  template_slug: string;
-  original_content: string;
-  created_at: string;
-  updated_at: string;
+// GET SINGLE NOTE - includes attendees, summary and (optionally) transcript
+async function getNote(id: string, includeTranscript: boolean): Promise<Note> {
+  return await apiGet(`/notes/${id}`, includeTranscript ? { include: 'transcript' } : {});
 }
 
 // UNIFIED MEETING DATA
@@ -158,6 +183,7 @@ interface MeetingData {
   durationMin?: number;
   panelContent?: string;
   tags?: string[];
+  webUrl?: string;
 }
 
 // VAULT INDEX
@@ -167,6 +193,20 @@ interface ExistingMeeting {
   startTime: Date;
   status: 'filed' | 'scheduled';
   id: string; // calendar_event_id from frontmatter
+  date: string; // YYYY-MM-DD (Eastern) from frontmatter
+}
+
+// Eastern-date string used for filenames and dedup keys
+function easternDate(d: Date): string {
+  return d.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}
+
+// MIGRATION SAFETY: the legacy private API used UUID document ids, the official
+// public API uses `not_...` ids. Meetings already in the vault therefore can't be
+// matched by id, so fall back to a date + normalized-title key to avoid
+// re-syncing the entire overlap window as duplicates.
+function dedupKey(title: string, date: string): string {
+  return `${date}|${normalizeTitle(title)}`;
 }
 
 // TITLE NORMALIZATION FOR MATCHING
@@ -245,12 +285,16 @@ async function indexVaultMeetings(vaultPath: string): Promise<ExistingMeeting[]>
         const frontmatter = parsed.data;
 
         if (frontmatter.source === 'granola' && frontmatter.calendar_event_id) {
+          const startTime = new Date(frontmatter.start_time || '');
           meetings.push({
             filePath,
             title: frontmatter.title || '',
-            startTime: new Date(frontmatter.start_time || ''),
+            startTime,
             status: frontmatter.status || 'scheduled',
-            id: frontmatter.calendar_event_id
+            id: frontmatter.calendar_event_id,
+            date: frontmatter.date
+              ? String(frontmatter.date).slice(0, 10)
+              : (isNaN(startTime.getTime()) ? '' : easternDate(startTime))
           });
         }
       } catch (error) {
@@ -331,27 +375,58 @@ async function processSingleMeeting(): Promise<void> {
 }
 
 
+// SUMMARY HEADING NORMALIZATION
+// The legacy panel scraper emitted H3 sections, so the whole vault nests summary
+// content at `###` beneath `## Summary`. The public API's summary_markdown starts
+// at `#`, which would put multiple H1s in every note. Shift headings so the
+// shallowest becomes H3, preserving relative depth. Fenced code blocks are left
+// alone so `#` comments inside them aren't mangled.
+function normalizeSummaryHeadings(markdown: string): string {
+  if (!markdown) return '';
+
+  const lines = markdown.split('\n');
+  const headingRe = /^(#{1,6})(\s+\S)/;
+
+  let inFence = false;
+  let minLevel = 7;
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    const m = line.match(headingRe);
+    if (m) minLevel = Math.min(minLevel, m[1].length);
+  }
+
+  if (minLevel === 7 || minLevel >= 3) return markdown;
+
+  const shift = 3 - minLevel;
+  inFence = false;
+  return lines
+    .map(line => {
+      if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; return line; }
+      if (inFence) return line;
+      return line.replace(headingRe, (_, hashes, rest) =>
+        '#'.repeat(Math.min(6, hashes.length + shift)) + rest
+      );
+    })
+    .join('\n');
+}
+
 // CONTENT VALIDATION FUNCTION
-function hasContent(transcriptData: any, panels?: Panel[]): boolean {
-  // Check transcript segments
-  const segments = Array.isArray(transcriptData) ? transcriptData :
-                  transcriptData?.segments || 
-                  transcriptData?.transcript?.segments || 
-                  [];
-  
-  const hasTranscriptContent = segments.length > 0;
-  
-  // Check panels
-  const hasPanelContent = panels && panels.length > 0 && 
-    panels.some(p => p.original_content && p.original_content.trim().length > 0);
-  
-  return hasTranscriptContent || hasPanelContent || false;
+// The public API only returns notes that already have a generated summary, but a
+// note can still come back with an empty transcript and an empty summary.
+function hasContent(note: Note): boolean {
+  const hasTranscriptContent = Array.isArray(note.transcript) && note.transcript.length > 0;
+  const hasSummaryContent = Boolean(
+    (note.summary_markdown && note.summary_markdown.trim()) ||
+    (note.summary_text && note.summary_text.trim())
+  );
+
+  return hasTranscriptContent || hasSummaryContent;
 }
 
 // CHECK IF MEETING IS IN THE PAST
-function isPastMeeting(meeting: GranolaDoc): boolean {
-  const meetingTime = new Date(meeting.created_at);
-  return meetingTime < new Date();
+function isPastMeeting(startTime: Date): boolean {
+  return startTime < new Date();
 }
 
 // NORMALIZE ATTENDEE DATA FOR CONSISTENT FORMATTING
@@ -363,7 +438,7 @@ function normalizeAttendee(attendee: { name?: string; email?: string }): string 
 // SHARED FUNCTION TO PROCESS AND WRITE MEETINGS
 async function processAndWriteMeeting(data: MeetingData, existingMeeting?: ExistingMeeting): Promise<{ success: boolean; filePath?: string }> {
   // Convert to Eastern timezone for date components
-  const easternDateStr = data.startTime.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const easternDateStr = easternDate(data.startTime);
   const dayName = data.startTime.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/New_York' });
 
   // Use existing file path if updating, otherwise create new path
@@ -375,7 +450,8 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
   } else {
     // Create new file path with flat structure: YYYY-MM-DD-DDD-Title--hash.md
     const cleanTitle = data.title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').trim();
-    const shortId = data.id.substring(0, 8);
+    // Strip the `not_` prefix so the suffix carries 8 chars of real entropy
+    const shortId = data.id.replace(/^not_/, '').substring(0, 8);
     const filename = `${easternDateStr}-${dayName}-${cleanTitle}--${shortId}.md`;
     filePath = join(VAULT_PATH, filename);
 
@@ -406,7 +482,9 @@ async function processAndWriteMeeting(data: MeetingData, existingMeeting?: Exist
     privacy: 'internal',
     calendar_event_id: data.id,
     meeting_url: data.meetingUrl || '',
-    transcript_url: data.status === 'filed' ? `https://notes.granola.ai/d/${data.id}` : ''
+    transcript_url: data.status === 'filed'
+      ? (data.webUrl || `https://notes.granola.ai/d/${data.id}`)
+      : ''
   };
 
   // Preserve directive in frontmatter tags
@@ -438,31 +516,18 @@ ${data.transcript}` : ''}`
 `;
   
   const markdown = matter.stringify(content, frontmatter);
-  
+
+  if (config.dryRun) {
+    console.log(`[dry-run] would write ${filePath} (${markdown.length} bytes)`);
+    return { success: true, filePath };
+  }
+
   // Write file
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, markdown, 'utf-8');
 
   console.log(data.status === 'filed' ? `✓ ${data.title}` : `📅 ${data.title} (${easternDateStr})`);
   return { success: true, filePath };
-}
-
-// PANEL API FUNCTION
-async function getPanels(documentId: string, token: string): Promise<Panel[]> {
-  const response = await fetch(`${API_BASE}/get-document-panels`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ document_id: documentId })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch panels: ${response.status}`);
-  }
-
-  return await response.json();
 }
 
 // MAIN SYNC FUNCTION
@@ -475,40 +540,27 @@ async function main(): Promise<void> {
   const existingMeetings = await indexVaultMeetings(VAULT_PATH);
   console.log(`   Found ${existingMeetings.length} existing meetings`);
 
-  // 2. GET AUTH TOKEN (auto-refreshes if expired)
-  const token = await getValidToken();
+  // Build a date+title lookup so legacy UUID-keyed files still dedupe against
+  // the new `not_...` note ids.
+  const existingKeys = new Set(
+    existingMeetings
+      .filter(em => em.status === 'filed' && em.date)
+      .map(em => dedupKey(em.title, em.date))
+  );
 
-  // 3. FETCH PAST/PROCESSED MEETINGS FROM API
+  // 2. FETCH PAST/PROCESSED MEETINGS FROM API
   console.log('\n📥 Fetching processed meetings from API...');
-  const docsResponse = await fetch(`${API_BASE}/get-documents`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'Granola/1.0',
-      'X-Client-Version': '1.0.0'
-    },
-    body: JSON.stringify({ limit: config.meetingsLimit })
-  });
 
-  if (!docsResponse.ok) {
-    const error = `Docs API failed: ${docsResponse.status} ${docsResponse.statusText}`;
+  let meetings: NoteSummary[];
+  try {
+    meetings = await listNotes(config.meetingsLimit);
+  } catch (err: any) {
+    const error = `Notes API failed: ${err.message}`;
     sendPushover('Granola Sync FAILED', error);
     await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for Pushover
     throw new Error(error);
   }
 
-  const docsData = await docsResponse.json();
-  // Handle both direct array and wrapped { documents: [...] } response
-  const meetings: GranolaDoc[] = Array.isArray(docsData) ? docsData : (docsData.documents || docsData.docs || []);
-
-  // Debug: log response structure if not an array
-  if (!Array.isArray(docsData)) {
-    console.log(`   API response keys: ${Object.keys(docsData).join(', ')}`);
-    if (docsData.message) {
-      console.log(`   API message: ${docsData.message}`);
-    }
-  }
   console.log(`   Found ${meetings.length} processed meetings`);
 
   // API should ALWAYS return past meetings
@@ -525,116 +577,108 @@ async function main(): Promise<void> {
 
   // 4. PROCESS PAST MEETINGS (FILED MEETINGS WITH DEDUPLICATION)
   console.log('\n📝 Processing past meetings...');
-  for (const meeting of meetings) {
+  for (const summary of meetings) {
+    const rawTitle = summary.title || 'Untitled Meeting';
+    const startTime = new Date(summary.created_at);
+
     // Check if we already have a filed meeting with this Granola ID
-    const existingFiledMeeting = existingMeetings.find(em => 
-      em.id === meeting.id && em.status === 'filed'
+    const existingFiledMeeting = existingMeetings.find(em =>
+      em.id === summary.id && em.status === 'filed'
     );
-    
+
     if (existingFiledMeeting) {
-      console.log(`⏭️  Already exists: ${meeting.title}`);
+      console.log(`⏭️  Already exists: ${rawTitle}`);
       continue;
     }
-    
-    // Check if meeting has panels (required for sync)
-    let panels: Panel[] = [];
+
+    // Legacy files predate the `not_...` id scheme — match on date + title too
+    const legacyTitle = titleHasTranscriptTag(rawTitle) ? stripTranscriptTag(rawTitle) : rawTitle;
+    if (existingKeys.has(dedupKey(legacyTitle, easternDate(startTime)))) {
+      console.log(`⏭️  Already exists (date+title): ${rawTitle}`);
+      continue;
+    }
+
+    // The transcript is always requested — the solo/empty skip checks below need
+    // it even when the transcript body won't be written into the note itself.
+    const wantsTranscript = shouldSyncTranscript(rawTitle);
+
+    let note: Note;
     try {
-      panels = await getPanels(meeting.id, token);
-    } catch (error) {
-      console.log(`⚠️  Failed to fetch panels for ${meeting.title} - skipping`);
+      await sleep(REQUEST_INTERVAL_MS);
+      note = await getNote(summary.id, true);
+    } catch (error: any) {
+      const message = `Failed to fetch note for ${rawTitle} - skipping (${error.message})`;
+      console.error(message);
+      sendPushover('Granola Sync Warning', message);
       continue;
     }
 
-    if (!panels || panels.length === 0) {
-      console.log(`⏳ No panels yet: ${meeting.title}`);
-      continue;
-    }
-    
-    // Fetch metadata and transcript
-    const [metaResponse, transcriptResponse] = await Promise.all([
-      fetch(`${API_BASE}/get-document-metadata`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ document_id: meeting.id })
-      }),
-      fetch(`${API_BASE}/get-document-transcript`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ document_id: meeting.id })
-      })
-    ]);
-
-    if (!metaResponse.ok || !transcriptResponse.ok) {
-      const error = `Failed to fetch data for ${meeting.title} - skipping`;
-      console.error(error);
-      sendPushover('Granola Sync Warning', error);
-      continue;
-    }
-
-    const metadata: DocMetadata = await metaResponse.json();
-    const transcriptData = await transcriptResponse.json();
-    
     // Filter out solo/empty meetings
-    const processedTranscript = processTranscript(transcriptData);
-    const hasTranscriptDirective = titleHasTranscriptTag(meeting.title);
-    const cleanedTitle = hasTranscriptDirective ? stripTranscriptTag(meeting.title) : meeting.title;
+    const processedTranscript = processTranscript(note.transcript);
+    const hasTranscriptDirective = titleHasTranscriptTag(rawTitle);
+    const cleanedTitle = hasTranscriptDirective ? stripTranscriptTag(rawTitle) : rawTitle;
+    const attendees = note.attendees || [];
     const skipCheck = shouldSkipPastMeeting({
-      attendees: metadata.attendees || [],
+      attendees: attendees.map(a => ({ name: a.name || '', email: a.email })),
       transcript: processedTranscript,
-      title: meeting.title
+      title: rawTitle
     });
-    
+
     if (skipCheck.skip) {
-      console.log(`⏭️  Skipping past meeting: ${meeting.title} (${skipCheck.reason})`);
+      console.log(`⏭️  Skipping past meeting: ${rawTitle} (${skipCheck.reason})`);
       skippedCount++;
       continue;
     }
-    
-    // Only do full transcript processing if we're syncing transcripts for this meeting
-    const finalTranscript = shouldSyncTranscript(meeting.title) ? processedTranscript : '';
-    
+
+    // Only include the transcript body if this meeting is configured for it
+    const finalTranscript = wantsTranscript ? processedTranscript : '';
+
     // CONTENT VALIDATION FOR PAST MEETINGS - Skip empty meetings
-    if (isPastMeeting(meeting)) {
-      if (!hasContent(transcriptData, panels)) {
-        console.log(`⏭️  Skipping empty: ${meeting.title} (0 segments, ${panels.length} panels)`);
+    if (isPastMeeting(startTime)) {
+      if (!hasContent(note)) {
+        console.log(`⏭️  Skipping empty: ${rawTitle} (no transcript or summary)`);
         skippedCount++;
         continue;
       }
     }
-    
-    // Panel processing using already fetched panels
-    let panelContent = '';
-    try {
-      if (panels && panels.length > 0) {
-        // Sort panels: specified template first
-        const sortedPanels = panels.sort((a, b) => 
-          (b.template_slug === TEMPLATE_SLUG ? 1 : 0) - 
-          (a.template_slug === TEMPLATE_SLUG ? 1 : 0)
+
+    // The public API returns the AI summary as markdown directly, replacing the
+    // HTML panel scraping the private API required.
+    const panelContent = normalizeSummaryHeadings(
+      (note.summary_markdown || note.summary_text || '').trim()
+    );
+
+    // Duration comes from the calendar event when both scheduled times exist
+    const scheduledStart = note.calendar_event?.scheduled_start_time;
+    const scheduledEnd = note.calendar_event?.scheduled_end_time;
+    let endTime: Date | undefined;
+    let durationMin = 0;
+    if (scheduledEnd) {
+      endTime = new Date(scheduledEnd);
+      if (scheduledStart) {
+        durationMin = Math.max(
+          0,
+          Math.round((endTime.getTime() - new Date(scheduledStart).getTime()) / 60000)
         );
-        panelContent = processPanels(sortedPanels);
       }
-    } catch (error) {
-      console.error(`Failed to process panels for "${meeting.title}":`, error);
-      // Continue without panels - don't break existing functionality
     }
-    
+
     // Normalize data for shared function
     const meetingData: MeetingData = {
-      id: meeting.id,
+      id: summary.id,
       title: cleanedTitle,
-      startTime: new Date(meeting.created_at),
-      attendees: metadata.attendees?.map(normalizeAttendee).filter(Boolean) || [],
-      organizer: metadata.creator?.name || '',
+      startTime,
+      endTime,
+      durationMin,
+      attendees: attendees
+        .map(a => normalizeAttendee({ name: a.name || undefined, email: a.email }))
+        .filter(Boolean),
+      organizer: note.owner?.name || note.calendar_event?.organiser || '',
       location: '',
       status: 'filed',
       transcript: finalTranscript,
-      panelContent: panelContent,
+      panelContent,
+      webUrl: note.web_url,
       tags: hasTranscriptDirective ? ['#transcript'] : undefined
     };
     
@@ -642,7 +686,7 @@ async function main(): Promise<void> {
     const matchingScheduledMeeting = findMatchingScheduledMeeting(meetingData, existingMeetings);
     
     if (matchingScheduledMeeting) {
-      console.log(`🔄 Updating scheduled meeting: ${meeting.title} → ${matchingScheduledMeeting.filePath}`);
+      console.log(`🔄 Updating scheduled meeting: ${rawTitle} → ${matchingScheduledMeeting.filePath}`);
       const result = await processAndWriteMeeting(meetingData, matchingScheduledMeeting);
       if (result.success && result.filePath) {
         processedCount++;
@@ -659,7 +703,7 @@ async function main(): Promise<void> {
   }
 
   // 5. PROCESS NEWLY SYNCED MEETINGS
-  if (config.enableMeetingProcessing && newlyProcessedMeetings.length > 0) {
+  if (config.enableMeetingProcessing && newlyProcessedMeetings.length > 0 && !config.dryRun) {
     console.log(`\n🤖 Processing ${newlyProcessedMeetings.length} newly synced meetings...`);
     await processSingleMeeting();
   }
