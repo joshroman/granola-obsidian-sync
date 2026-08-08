@@ -72,3 +72,6 @@ temp/*
 
 # Local query cache built by the granola CLI
 .cache/
+
+# Build output (regenerate with: bun run build:plugin)
+dist/

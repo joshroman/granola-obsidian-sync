@@ -6,7 +6,8 @@
   "scripts": {
     "sync": "bun run sync.ts",
     "test": "bun tests/sync.test.ts && bun tests/granola.test.ts",
-    "granola": "bun granola.ts"
+    "granola": "bun granola.ts",
+    "build:plugin": "bun build granola.ts --target=bun --outfile dist/granola.js && cp dist/granola.js ~/Projects/claude-code-plugins/plugins/granola/skills/granola/granola && chmod +x ~/Projects/claude-code-plugins/plugins/granola/skills/granola/granola && echo \"plugin bundle updated\""
   },
   "dependencies": {
     "dotenv": "^17.2.1",

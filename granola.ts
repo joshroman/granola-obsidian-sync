@@ -28,8 +28,10 @@ import {
 } from './granola-api';
 import { processTranscript } from './transcript-processor';
 
+// Kept out of the source tree so the bundled plugin does not write into its own
+// install directory. Override with GRANOLA_CACHE_PATH.
 const CACHE_PATH = resolvePath(
-  process.env.GRANOLA_CACHE_PATH || join(import.meta.dir, '.cache', 'summaries.json')
+  process.env.GRANOLA_CACHE_PATH || '~/.cache/granola/summaries.json'
 );
 
 const easternDate = (iso: string) =>
