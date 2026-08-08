@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "sync": "bun run sync.ts",
-    "test": "bun tests/sync.test.ts"
+    "test": "bun tests/sync.test.ts && bun tests/granola.test.ts",
+    "granola": "bun granola.ts"
   },
   "dependencies": {
     "dotenv": "^17.2.1",

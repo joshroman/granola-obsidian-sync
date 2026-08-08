@@ -1,45 +1,24 @@
 #!/usr/bin/env bun
 
-import 'dotenv/config';
-import dotenv from 'dotenv';
+import './env';
+import { resolvePath, requireEnv } from './env';
 import { readFile, writeFile, mkdir, access, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
-import { homedir } from 'os';
 import matter from 'gray-matter';
 import { processTranscript, shouldSkipPastMeeting, titleHasTranscriptTag } from './transcript-processor';
+import {
+  listNotes, getNote, sleep, REQUEST_INTERVAL_MS,
+  type NoteSummary, type Note, type TranscriptSegmentApi,
+} from './granola-api';
 
 // --- CONFIGURATION ---
 // All user-configurable values are sourced from environment variables.
 // See .env.example for details.
 
-// Helper to resolve tilde (~) in paths
-const resolvePath = (p: string) => (p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
-
-// Shared secrets live alongside the other automation credentials. The local .env
-// is loaded first and wins; this only fills in what it does not define.
-const SHARED_ENV_PATH = resolvePath(
-  process.env.JOSH_AUTOMATIONS_ENV || '~/.config/josh-automations/.env'
-);
-if (existsSync(SHARED_ENV_PATH)) {
-  dotenv.config({ path: SHARED_ENV_PATH });
-}
-
-const requiredEnvVars = [
-  'GRANOLA_API_KEY',
-  'OBSIDIAN_VAULT_MEETINGS_PATH',
-];
-
-// Validate required environment variables
-for (const varName of requiredEnvVars) {
-  if (!process.env[varName]) {
-    throw new Error(`Missing required environment variable: ${varName}. Please copy .env.example to .env and set this value.`);
-  }
-}
-
 const config = {
-  granolaApiKey: process.env.GRANOLA_API_KEY!,
-  obsidianVaultPath: resolvePath(process.env.OBSIDIAN_VAULT_MEETINGS_PATH!),
+  granolaApiKey: requireEnv('GRANOLA_API_KEY'),
+  obsidianVaultPath: resolvePath(requireEnv('OBSIDIAN_VAULT_MEETINGS_PATH')),
   meetingsLimit: parseInt(process.env.GRANOLA_MEETINGS_LIMIT || '50'),
   // DRY_RUN=true reports what would be written without touching the vault
   dryRun: process.env.DRY_RUN === 'true',
@@ -59,94 +38,9 @@ if (config.enableMeetingProcessing) {
 
 // --- END CONFIGURATION ---
 
-// Official Granola public API (https://docs.granola.ai/introduction)
-// Auth is a static `grn_` key from Granola → Settings → Connectors → API keys.
-// GRANOLA_API_BASE exists so the sync can be pointed at a local mock in tests.
-const API_BASE = process.env.GRANOLA_API_BASE || 'https://public-api.granola.ai/v1';
+// The API client, types and rate limiting live in granola-api.ts, shared with
+// the granola CLI.
 const VAULT_PATH = config.obsidianVaultPath;
-
-// API limits: 30 notes/page max, 5 req/sec sustained (300/min), 25 burst per 5s.
-const PAGE_SIZE = 30;
-const REQUEST_INTERVAL_MS = 250; // ~4 req/sec, comfortably under the sustained limit
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-// TYPES — mirror the documented public API schema
-interface NoteSummary {
-  id: string;
-  title: string | null;
-  owner?: { name: string | null; email: string };
-  created_at: string;
-}
-
-interface TranscriptSegmentApi {
-  speaker?: {
-    source?: 'microphone' | 'speaker';
-    attribution?: 'me' | 'them';
-    name?: string;
-  };
-  text: string;
-  start_time?: string;
-  end_time?: string;
-}
-
-interface Note extends NoteSummary {
-  web_url?: string;
-  calendar_event?: {
-    organiser?: string | null;
-    scheduled_start_time?: string | null;
-    scheduled_end_time?: string | null;
-  };
-  attendees?: Array<{ name: string | null; email: string }>;
-  summary_text?: string;
-  summary_markdown?: string | null;
-  transcript?: TranscriptSegmentApi[] | null;
-}
-
-// AUTHENTICATED REQUEST HELPER
-async function apiGet(path: string, params: Record<string, string> = {}): Promise<any> {
-  const url = new URL(`${API_BASE}${path}`);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
-
-  const response = await fetch(url, {
-    headers: {
-      'Authorization': `Bearer ${config.granolaApiKey}`,
-      'Accept': 'application/json'
-    }
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(`GET ${path} failed: ${response.status} ${response.statusText} ${body}`.trim());
-  }
-
-  return await response.json();
-}
-
-// LIST NOTES - cursor-paginated, newest first
-async function listNotes(limit: number): Promise<NoteSummary[]> {
-  const notes: NoteSummary[] = [];
-  let cursor: string | null = null;
-
-  while (notes.length < limit) {
-    const params: Record<string, string> = {
-      page_size: String(Math.min(PAGE_SIZE, limit - notes.length))
-    };
-    if (cursor) params.cursor = cursor;
-
-    const page = await apiGet('/notes', params);
-    const batch: NoteSummary[] = page.notes || [];
-    notes.push(...batch);
-
-    if (!page.hasMore || !page.cursor || batch.length === 0) break;
-    cursor = page.cursor;
-    await sleep(REQUEST_INTERVAL_MS);
-  }
-
-  return notes.slice(0, limit);
-}
 
 // Wall-clock minutes covered by a transcript, or undefined when it can't be
 // determined. Undefined rather than 0 so callers can tell "no data" apart from
@@ -164,11 +58,6 @@ function transcriptSpanMinutes(segments: TranscriptSegmentApi[] | null | undefin
   // Deliberately not rounded: a 25-second recording must stay below the
   // short-meeting threshold rather than rounding down to a falsy 0.
   return (Math.max(...stamps) - Math.min(...stamps)) / 60000;
-}
-
-// GET SINGLE NOTE - includes attendees, summary and (optionally) transcript
-async function getNote(id: string, includeTranscript: boolean): Promise<Note> {
-  return await apiGet(`/notes/${id}`, includeTranscript ? { include: 'transcript' } : {});
 }
 
 // UNIFIED MEETING DATA
@@ -479,7 +368,7 @@ async function main(): Promise<void> {
 
   let meetings: NoteSummary[];
   try {
-    meetings = await listNotes(config.meetingsLimit);
+    meetings = await listNotes({ limit: config.meetingsLimit, maxScan: config.meetingsLimit });
   } catch (err: any) {
     throw new Error(`Notes API failed: ${err.message}`);
   }
